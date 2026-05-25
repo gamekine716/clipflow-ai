@@ -2,13 +2,14 @@
 Video upload endpoints
 """
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel, HttpUrl
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
+from pydantic import BaseModel
 from typing import Optional
 import uuid
 
 from app.core.logger import log
 from app.services.youtube import YouTubeParser, YouTubeVideoError
+from app.services.file_upload import LocalFileUploader, FileUploadError, get_file_uploader
 from app.config import settings
 
 router = APIRouter()
@@ -20,6 +21,7 @@ class UploadResponse(BaseModel):
     video_id: Optional[str] = None
     title: Optional[str] = None
     duration: Optional[int] = None
+    file_path: Optional[str] = None
 
 class YouTubeMetadataResponse(BaseModel):
     video_id: str
@@ -32,7 +34,8 @@ class YouTubeMetadataResponse(BaseModel):
 @router.post("/upload", response_model=UploadResponse)
 async def upload_video(
     file: Optional[UploadFile] = File(None),
-    youtube_url: Optional[str] = Form(None)
+    youtube_url: Optional[str] = Form(None),
+    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     Upload video for processing.
@@ -41,6 +44,7 @@ async def upload_video(
     Args:
         file: MP4/MOV file upload
         youtube_url: YouTube video URL
+        background_tasks: FastAPI background tasks for cleanup
         
     Returns:
         Job details with processing status
@@ -55,9 +59,11 @@ async def upload_video(
             )
         
         job_id = str(uuid.uuid4())
-        youtube_parser = YouTubeParser()
         
         if youtube_url:
+            # YouTube URL upload
+            youtube_parser = YouTubeParser()
+            
             # Validate YouTube URL
             if not YouTubeParser.is_youtube_url(youtube_url):
                 raise HTTPException(
@@ -93,36 +99,36 @@ async def upload_video(
                 )
         
         else:  # file upload
-            # Validate file type
-            if file.content_type not in ["video/mp4", "video/quicktime", "video/x-msvideo"]:
+            uploader = get_file_uploader()
+            
+            try:
+                # Use streaming for potentially large files
+                upload_info = await uploader.stream_upload(file, job_id)
+                
+                log.info(
+                    "file_upload_initiated",
+                    job_id=job_id,
+                    filename=upload_info['filename'],
+                    size_mb=upload_info['file_size_mb']
+                )
+                
+                # Schedule cleanup after processing completes
+                # (This would be implemented in Phase 5 with Celery)
+                
+                return {
+                    "job_id": job_id,
+                    "status": "pending",
+                    "message": f"File upload complete: {upload_info['filename']}",
+                    "title": upload_info['filename'],
+                    "file_path": upload_info['file_path'],
+                }
+            
+            except FileUploadError as e:
+                log.error("file_upload_error", error=str(e))
                 raise HTTPException(
                     status_code=400,
-                    detail="Only MP4, MOV, and AVI files allowed"
+                    detail=str(e)
                 )
-            
-            # Check file size
-            file_size = file.size or 0
-            max_size = settings.MAX_VIDEO_SIZE_MB * 1024 * 1024
-            if file_size > max_size:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File size exceeds {settings.MAX_VIDEO_SIZE_MB}MB limit"
-                )
-            
-            log.info(
-                "file_upload_initiated",
-                job_id=job_id,
-                filename=file.filename,
-                size_mb=file_size / (1024 * 1024)
-            )
-            
-            # TODO: Phase 1b - Implement actual file storage
-            return {
-                "job_id": job_id,
-                "status": "pending",
-                "message": f"File upload queued: {file.filename}",
-                "title": file.filename,
-            }
     
     except HTTPException:
         raise
